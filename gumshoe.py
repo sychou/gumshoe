@@ -748,16 +748,24 @@ def scan(config: Config, state: dict, only: str | None = None) -> list[Item]:
             continue
         kept = []
         skipped = skipped_ids(state, src.slug)
+        # Prune skip entries that have aged out of the feed — they can never
+        # be rediscovered, so the list stays bounded at the feed size (~15).
+        feed_ids = {v.item_id for v in vids}
+        if skipped - feed_ids:
+            state["sources"][src.slug]["skipped"] = sorted(skipped & feed_ids)
+            skipped &= feed_ids
         for v in vids:
             v.source = src.slug
             v.source_name = src.name
             if v.item_id in skipped:
                 continue
-            # Skip Shorts and clips — check duration for items not in vault
+            # Skip Shorts and clips — check duration for items not in vault,
+            # remembering shorts so they cost one lookup ever, not one per scan
             if not already_have(config.vault_root, src.slug, v.item_id):
                 dur = video_duration(v.item_id)
                 if dur is not None and dur < MIN_DURATION:
                     print(f"  skip ({dur}s): {v.title[:60]}")
+                    mark_skipped(state, src.slug, v.item_id)
                     continue
             kept.append(v)
         queue.extend(kept)
