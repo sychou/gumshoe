@@ -34,6 +34,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -102,7 +103,7 @@ class Config:
     newsletters: list[NewsletterSource] = field(default_factory=list)
     account: str = "choufam"
     newsletter_window_days: int = 1
-    tailscale_exit_nodes: list[str] = field(default_factory=list)
+    hooks: dict = field(default_factory=dict)  # engage/blocked/release commands
 
 
 def load_config() -> Config:
@@ -129,7 +130,7 @@ def load_config() -> Config:
         ))
     return Config(vault_root=vault, youtube=yt, newsletters=nl,
                   account=account, newsletter_window_days=window,
-                  tailscale_exit_nodes=raw.get("tailscale_exit_nodes", []))
+                  hooks=raw.get("hooks", {}))
 
 
 def resolve_channel_id(value: str) -> str:
@@ -368,30 +369,27 @@ _last_caption_fetch = 0.0
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Tailscale exit-node rotation
+# Rotation hooks
 # ──────────────────────────────────────────────────────────────────────
+# Optional external commands invoked around YouTube fetching to rotate the
+# network egress when an IP gets blocked (e.g. a Tailscale exit-node
+# rotator). gumshoe stays agnostic: it runs whatever `[hooks]` names and
+# reads the exit code. Without hooks configured, it fetches directly.
 
-def tailscale_available() -> bool:
-    import shutil
-    return bool(shutil.which("tailscale"))
-
-
-def set_exit_node(node: str | None) -> bool:
-    """Set or clear the Tailscale exit node. Returns True on success."""
-    if not tailscale_available():
-        return False
-    cmd = ["tailscale", "set"]
-    if node:
-        cmd += ["--exit-node", node]
-        print(f"  [tailscale] switching exit node to {node}")
-    else:
-        cmd += ["--exit-node", ""]
-        print("  [tailscale] clearing exit node")
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if proc.returncode != 0:
-        print(f"  [tailscale] failed: {proc.stderr.strip()[:200]}", file=sys.stderr)
-        return False
-    return True
+def run_hook(command: str | None) -> int | None:
+    """Run a configured hook command. Returns its exit code, or None when no
+    command is configured or it can't be launched. `{pid}` in the command is
+    replaced with gumshoe's pid (for a rotator's owner lease)."""
+    if not command:
+        return None
+    cmd = shlex.split(command.replace("{pid}", str(os.getpid())))
+    try:
+        proc = subprocess.run(cmd, timeout=60, check=False)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        print(f"  [hook] {cmd[0] if cmd else '?'} failed: {type(e).__name__}",
+              file=sys.stderr)
+        return None
+    return proc.returncode
 
 
 def caption_rate_ok() -> bool:
@@ -827,8 +825,6 @@ def fetch(config: Config, state: dict, queue: list[Item]) -> tuple[int, int, int
     fetched_count = 0
     deferred = 0
     failed = 0
-    exit_node_idx = 0
-    using_exit_node = False
     youtube_halted = False
     remaining: list[Item] = []  # items deferred or failed, for next run
 
@@ -836,11 +832,9 @@ def fetch(config: Config, state: dict, queue: list[Item]) -> tuple[int, int, int
     cutoff = time.time() - 3600.0
     _caption_times[:] = [t for t in state.get("caption_times", []) if t > cutoff]
 
-    # If Tailscale exit nodes are configured, start with the first one
-    if config.tailscale_exit_nodes and tailscale_available() and \
-            set_exit_node(config.tailscale_exit_nodes[0]):
-        using_exit_node = True
-        exit_node_idx = 0
+    # Engage the rotation hook if configured (best-effort — a caption fetch
+    # rides whatever exit node is active, so we proceed regardless).
+    run_hook(config.hooks.get("engage"))
 
     try:
         for item in queue:
@@ -860,15 +854,14 @@ def fetch(config: Config, state: dict, queue: list[Item]) -> tuple[int, int, int
                 print(f"[fetch] YouTube: {item.title}")
                 text, status = fetch_captions(item)
                 if status == "blocked":
-                    # Try rotating to the next exit node, then retry once
-                    if using_exit_node and exit_node_idx + 1 < len(config.tailscale_exit_nodes):
-                        exit_node_idx += 1
-                        next_node = config.tailscale_exit_nodes[exit_node_idx]
-                        print(f"  YouTube IP block — rotating to {next_node}", file=sys.stderr)
-                        record_failure(state, slug, item.item_id, f"YouTube IP block — rotating to {next_node}")
-                        if set_exit_node(next_node):
-                            _caption_times.clear()
-                            text, status = fetch_captions(item)
+                    # Ask the rotation hook to move to a fresh egress, then
+                    # retry once. Exit 0 = rotated; anything else (or no hook)
+                    # = can't rotate, so halt YouTube and preserve the queue.
+                    if run_hook(config.hooks.get("blocked")) == 0:
+                        print("  YouTube IP block — rotated egress, retrying", file=sys.stderr)
+                        record_failure(state, slug, item.item_id, "YouTube IP block — rotated")
+                        _caption_times.clear()
+                        text, status = fetch_captions(item)
                     if status == "blocked":
                         print("  YouTube IP block — halting YouTube; queue preserved", file=sys.stderr)
                         record_failure(state, slug, item.item_id, "YouTube IP block")
@@ -912,8 +905,7 @@ def fetch(config: Config, state: dict, queue: list[Item]) -> tuple[int, int, int
                 fetched_count += 1
                 print(f"  wrote {path.relative_to(vault)}")
     finally:
-        if using_exit_node:
-            set_exit_node(None)
+        run_hook(config.hooks.get("release"))
 
     # Persist only remaining (deferred) items for the next run
     state["queue"] = serialize_queue(remaining)
@@ -1053,9 +1045,14 @@ sender = "newsletter@example.com"
 # subject = "Daily"            # optional subject match
 # account = "isomer"           # per-source override (default: global account)
 
-# Tailscale exit nodes to rotate through when YouTube blocks an IP.
-# Only set on machines that are not exit nodes themselves. Omit to disable.
-# tailscale_exit_nodes = ["us-chi-wg-301.mullvad.ts.net", "us-dal-wg-001.mullvad.ts.net"]
+# Optional external commands to rotate network egress when YouTube blocks an
+# IP. gumshoe runs them and reads the exit code (blocked: 0 = rotated, retry;
+# nonzero = halt YouTube). Without hooks it fetches on the direct connection.
+# {pid} is replaced with gumshoe's process id. Example uses `jaunt`:
+# [hooks]
+# engage  = "jaunt --ns youtube engage --owner {pid}"
+# blocked = "jaunt --ns youtube next --owner {pid}"
+# release = "jaunt --ns youtube clear"
 '''
     print(sample)
     return 0
