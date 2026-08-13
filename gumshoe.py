@@ -832,10 +832,6 @@ def fetch(config: Config, state: dict, queue: list[Item]) -> tuple[int, int, int
     cutoff = time.time() - 3600.0
     _caption_times[:] = [t for t in state.get("caption_times", []) if t > cutoff]
 
-    # Engage the rotation hook if configured (best-effort — a caption fetch
-    # rides whatever exit node is active, so we proceed regardless).
-    run_hook(config.hooks.get("engage"))
-
     try:
         for item in queue:
             slug = item.source or slugify(item.source_name)
@@ -905,46 +901,51 @@ def fetch(config: Config, state: dict, queue: list[Item]) -> tuple[int, int, int
                 fetched_count += 1
                 print(f"  wrote {path.relative_to(vault)}")
     finally:
-        run_hook(config.hooks.get("release"))
-
-    # Persist only remaining (deferred) items for the next run
-    state["queue"] = serialize_queue(remaining)
-    state["caption_times"] = list(_caption_times)
+        # Persist remaining (deferred) items and the rate window, even on error
+        state["queue"] = serialize_queue(remaining)
+        state["caption_times"] = list(_caption_times)
 
     return fetched_count, deferred, failed
 
 
 def run(config: Config, state: dict, only: str | None = None,
         scan_only: bool = False, fetch_only: bool = False) -> int:
-    if fetch_only:
-        # Fetch from the persisted queue in state
-        raw_q = state.get("queue", [])
-        if not raw_q:
-            print("[fetch] no queued items to fetch")
+    # Engage rotation for the whole run so the scan phase — feed polls and the
+    # per-video duration lookups — rides the rotated egress too, not just
+    # caption fetching. Best-effort: proceed on whatever node ends up active.
+    run_hook(config.hooks.get("engage"))
+    try:
+        if fetch_only:
+            # Fetch from the persisted queue in state
+            raw_q = state.get("queue", [])
+            if not raw_q:
+                print("[fetch] no queued items to fetch")
+                state["last_run"] = datetime.now(timezone.utc).isoformat()
+                save_state(state)
+                return 0
+            # Re-filter: drop items already held since the queue was built
+            queue = prepare(config.vault_root, deserialize_queue(raw_q), state)
+        else:
+            # Scan + prepare. Carry the previously persisted queue along so
+            # deferred items survive scoped runs and fresh scans (prepare's
+            # dedup drops anything rediscovered).
+            discovered = scan(config, state, only=only)
+            discovered.extend(deserialize_queue(state.get("queue", [])))
+            queue = prepare(config.vault_root, discovered, state)
+
+        if scan_only:
             state["last_run"] = datetime.now(timezone.utc).isoformat()
             save_state(state)
+            print(f"\n[done] scanned {len(queue)} items queued for fetch")
             return 0
-        # Re-filter: drop items already held since the queue was built
-        queue = prepare(config.vault_root, deserialize_queue(raw_q), state)
-    else:
-        # Scan + prepare. Carry the previously persisted queue along so
-        # deferred items survive scoped runs and fresh scans (prepare's
-        # dedup drops anything rediscovered).
-        discovered = scan(config, state, only=only)
-        discovered.extend(deserialize_queue(state.get("queue", [])))
-        queue = prepare(config.vault_root, discovered, state)
 
-    if scan_only:
+        fetched_count, deferred, failed = fetch(config, state, queue)
         state["last_run"] = datetime.now(timezone.utc).isoformat()
         save_state(state)
-        print(f"\n[done] scanned {len(queue)} items queued for fetch")
+        print(f"\n[done] fetched={fetched_count} deferred={deferred} failed={failed}")
         return 0
-
-    fetched_count, deferred, failed = fetch(config, state, queue)
-    state["last_run"] = datetime.now(timezone.utc).isoformat()
-    save_state(state)
-    print(f"\n[done] fetched={fetched_count} deferred={deferred} failed={failed}")
-    return 0
+    finally:
+        run_hook(config.hooks.get("release"))
 
 
 # ──────────────────────────────────────────────────────────────────────
