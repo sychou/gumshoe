@@ -790,10 +790,32 @@ def scan(config: Config, state: dict, only: str | None = None) -> list[Item]:
     return queue
 
 
+def content_key(item: Item) -> tuple[str, str]:
+    """A source-agnostic identity for near-duplicate detection: same published
+    date and title. Catches an episode a feed lists under two video IDs (a
+    re-upload or member cut), which item_id dedup can't — they file as distinct
+    items with the same date and title."""
+    return (item.published.date().isoformat(), slugify(item.title))
+
+
+def content_held(vault: Path, slug: str, key: tuple[str, str]) -> bool:
+    """True if a file for this (date, title-slug) already exists, regardless of
+    item_id — the on-disk counterpart to content_key. Matches both `<base>.md`
+    and the `<base>-N.md` the writer used before this dedup existed."""
+    folder = vault / safe_dir(slug)
+    if not folder.is_dir():
+        return False
+    base = f"{key[0]}-{key[1]}"
+    return any(p.stem == base or p.stem.startswith(base + "-")
+               for p in folder.glob("*.md"))
+
+
 def prepare(vault: Path, queue: list[Item], state: dict) -> list[Item]:
-    """Phase 2: dedup, drop already-held, sort newest-first, persist to state."""
+    """Phase 2: dedup (by item_id and by content), drop already-held, sort
+    newest-first, persist to state."""
     clean: list[Item] = []
     seen_ids: set[str] = set()
+    seen_content: set[tuple[str, str]] = set()
     for item in queue:
         slug = item.source or slugify(item.source_name)
         if item.item_id in seen_ids:
@@ -801,10 +823,18 @@ def prepare(vault: Path, queue: list[Item], state: dict) -> list[Item]:
         seen_ids.add(item.item_id)
         if item.item_id in skipped_ids(state, slug):
             continue
+        key = content_key(item)
+        # Same date+title as something already taken this run or already filed —
+        # a re-upload under a different video ID. Drop it.
+        if key in seen_content or content_held(vault, slug, key):
+            if item.extra.get("one_off"):
+                consume_queue_item(item.extra.get("queue_line", item.url))
+            continue
         if already_have(vault, slug, item.item_id):
             if item.extra.get("one_off"):
                 consume_queue_item(item.extra.get("queue_line", item.url))
             continue
+        seen_content.add(key)
         clean.append(item)
 
     clean.sort(key=lambda i: (i.fetcher != "newsletter", -i.published.timestamp()))
