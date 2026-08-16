@@ -22,7 +22,7 @@ synthesize, or report — it acquires and files. The archive is the product.
 mkdir -p ~/.config/gumshoe
 cat > ~/.config/gumshoe/config.toml <<'EOF'
 vault_root = "~/Vaults/Gumshoe"
-account = "choufam"            # gog account for newsletters
+account = "personal"            # gog account for newsletters
 newsletter_window_days = 1
 
 [[youtube]]
@@ -37,12 +37,12 @@ channel_id = "UCJIfeSCssxSC_Dhc5s7woww"
 name = "Example Newsletter"
 sender = "newsletter@example.com"
 # subject = "Daily"            # optional subject match
-# account = "isomer"          # per-source override (default: global account)
+# account = "work"          # per-source override (default: global account)
 
 [[newsletter]]
 name = "Work Newsletter"
 sender = "research@firm.com"
-account = "isomer"            # reads from the isomer Gmail, not choufam
+account = "work"            # reads from the work Gmail, not personal
 EOF
 ```
 

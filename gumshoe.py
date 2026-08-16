@@ -101,7 +101,7 @@ class Config:
     vault_root: Path
     youtube: list[YouTubeSource] = field(default_factory=list)
     newsletters: list[NewsletterSource] = field(default_factory=list)
-    account: str = "choufam"
+    account: str = "personal"
     newsletter_window_days: int = 1
     hooks: dict = field(default_factory=dict)  # engage/blocked/release commands
 
@@ -112,7 +112,7 @@ def load_config() -> Config:
     with CONFIG_FILE.open("rb") as f:
         raw = tomllib.load(f)
     vault = Path(raw.get("vault_root", DEFAULT_VAULT_ROOT)).expanduser()
-    account = raw.get("account", "choufam")
+    account = raw.get("account", "personal")
     window = raw.get("newsletter_window_days", 1)
     yt: list[YouTubeSource] = []
     for src in raw.get("youtube", []):
@@ -1059,7 +1059,7 @@ def cmd_sample(args: list[str]) -> int:
     sample = '''\
 # ~/.config/gumshoe/config.toml
 vault_root = "~/Vaults/Gumshoe"
-account = "choufam"            # gog account for newsletters
+account = "personal"            # gog account for newsletters
 newsletter_window_days = 1
 
 [[youtube]]
@@ -1074,7 +1074,7 @@ channel_id = "https://www.youtube.com/channel/UCxxxxxxxxxxxxxxxxxxxxxxxx"
 name = "Example Newsletter"
 sender = "newsletter@example.com"
 # subject = "Daily"            # optional subject match
-# account = "isomer"           # per-source override (default: global account)
+# account = "work"           # per-source override (default: global account)
 
 # Optional external commands to rotate network egress when YouTube blocks an
 # IP. gumshoe runs them and reads the exit code (blocked: 0 = rotated, retry;
