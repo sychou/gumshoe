@@ -57,14 +57,22 @@ account = "work"            # reads from the work Gmail, not personal
 name = "Example Podcast"
 feed_url = "https://example.com/feed.xml"
 # min_duration = 300         # skip episodes shorter than this (seconds)
+
+[[blog]]
+name = "Example Blog"
+feed_url = "https://example.com/blog/feed/"
+
+# podcast_window_days = 7    # first-scan lookback for podcasts and blogs
 EOF
 ```
 
 ## Usage
 
 ```bash
-gumshoe run                 # build queue + fetch: all sources
+gumshoe run                 # scan + fetch: all sources
 gumshoe run <source-name>   # one source only
+gumshoe scan [<source>]     # discover and queue only; no fetching
+gumshoe fetch               # fetch the persisted queue only
 gumshoe add <url>           # append a one-off URL to the queue
 gumshoe status              # cursors, queued items, last run, failures
 gumshoe sample              # print a sample config
@@ -85,17 +93,26 @@ install step. Dependencies (`requests`, `youtube-transcript-api`,
 
 ## How it works
 
-Each run has two phases:
+Each run has three phases, independently invocable:
 
-1. **Build the queue** — poll YouTube channel feeds, query gog for today's
-   newsletters, read the one-off URL queue. Candidate items are collected.
-2. **Fetch the queue** — process items newest-first, applying rate limits,
-   writing markdown files, advancing cursors. Items that don't fit the hourly
-   cap stay queued for next run; failed items stay queued for retry.
+1. **Scan** — poll YouTube channel feeds, podcast and blog RSS feeds, query
+   gog for newsletters, read the one-off URL queue. Candidate items are
+   collected.
+2. **Prepare** — dedupe (by item ID, and by date+title to catch re-uploads),
+   drop anything already held on disk, sort newest-first, persist the queue.
+3. **Fetch** — process the queue with rate and cost limits, writing markdown
+   files, advancing cursors. Items that don't fit the hourly caption cap or
+   the per-run podcast cap stay queued for the next run; failed items stay
+   queued for retry.
+
+All web traffic (feeds, watch pages, article pages, audio enclosures) goes
+through a single browser-emulating session — real browser headers and a
+persistent cookie jar — so hosts see a consistent client.
 
 Content, once fetched, is never re-fetched, moved, or deleted. The stable
-item ID (video ID, message ID) makes runs idempotent — an item whose file
-already exists is skipped at the cost of a file stat, not a network call.
+item ID (video ID, message ID, episode GUID, post GUID) makes runs
+idempotent — an item whose file already exists is skipped at the cost of a
+file stat, not a network call.
 
 ## Layout
 
@@ -109,8 +126,17 @@ already exists is skipped at the cost of a file stat, not a network call.
 
 Each markdown file has YAML frontmatter — source, source type, title,
 canonical URL, published date, fetched timestamp, stable item ID — and a body
-containing the content (transcript or newsletter text). The frontmatter
-schema is the contract with the separate reporting tool (sitrep).
+containing the content (transcript, article, or newsletter text). The
+frontmatter schema is the contract with the separate reporting tool (sitrep).
+
+## Egress rotation
+
+When YouTube rate-limits an IP, optional `[hooks]` commands rotate the
+network egress: gumshoe runs whatever the config names (`engage` before the
+run, `blocked` on an IP block, `release` after) and reads the exit code.
+`gumshoe sample` shows the shape; a Tailscale exit-node rotator (jaunt) is
+one implementation. Without hooks, gumshoe fetches on the direct connection
+and defers blocked items.
 
 ## Automation
 
