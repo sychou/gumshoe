@@ -15,6 +15,15 @@ synthesize, or report — it acquires and files. The archive is the product.
   `~/.config/gumshoe/queue.txt`). Consumed on successful fetch.
 - **Email newsletters** — via `gog` (Gmail). Configured by sender and optional
   subject match. Searches both inbox and archive for the day's newsletters.
+- **Podcasts** — poll the RSS feed, download the audio enclosure, downsample
+  with `ffmpeg`, and transcribe with OpenAI whisper-1 (~$0.36 per hour of
+  audio). Capped at 5 episodes per run; only episodes newer than what the
+  vault holds are taken, so adding a source never transcribes the back
+  catalog. Requires `ffmpeg` on PATH (`brew install ffmpeg`) and
+  `OPENAI_API_KEY` in the environment.
+- **Blogs** — poll the RSS feed and extract each new post's page as markdown
+  (defuddle, falling back to markdownify). Same no-backfill window as
+  podcasts.
 
 ## Setup
 
@@ -43,6 +52,11 @@ sender = "newsletter@example.com"
 name = "Work Newsletter"
 sender = "research@firm.com"
 account = "work"            # reads from the work Gmail, not personal
+
+[[podcast]]
+name = "Example Podcast"
+feed_url = "https://example.com/feed.xml"
+# min_duration = 300         # skip episodes shorter than this (seconds)
 EOF
 ```
 

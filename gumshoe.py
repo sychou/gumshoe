@@ -35,11 +35,14 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -49,6 +52,20 @@ except ImportError:  # pragma: no cover
     import tomli as tomllib  # type: ignore
 
 import requests
+
+# All web traffic (feeds, watch pages, article pages, enclosures) goes through
+# one browser-emulating session: real browser headers, and a cookie jar that
+# accepts and replays cookies across calls, so hosts see a consistent client.
+# API calls (OpenAI transcription) intentionally bypass this.
+BROWSER_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/126.0.0.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+SESSION = requests.Session()
+SESSION.headers.update(BROWSER_HEADERS)
 
 CONFIG_DIR = Path.home() / ".config" / "gumshoe"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
@@ -66,6 +83,17 @@ MIN_DURATION = 300  # skip videos shorter than 5 minutes
 
 ATOM_NS = "{http://www.w3.org/2005/Atom}"
 YT_NS = "{http://www.youtube.com/xml/schemas/2015}"
+ITUNES_NS = "{http://www.itunes.com/dtds/podcast-1.0.dtd}"
+
+# Podcast limits. Transcription is paid (per audio minute), so scans are
+# windowed to avoid back-catalog explosions and fetches are capped per run.
+PODCAST_WINDOW_DAYS = 7          # first-scan lookback when the vault is empty
+PODCAST_EPISODES_PER_RUN = 5     # cost cap; remainder deferred to next run
+MAX_EPISODE_SECONDS = 4 * 3600   # skip permanently above this
+ENCLOSURE_MAX_BYTES = 500 * 1024 * 1024
+MAX_UPLOAD_BYTES = 24 * 1024 * 1024  # OpenAI caps uploads at 25MB; leave headroom
+TRANSCRIBE_MODEL = "whisper-1"
+TRANSCRIBE_URL = "https://api.openai.com/v1/audio/transcriptions"
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -97,12 +125,38 @@ class NewsletterSource:
 
 
 @dataclass
+class PodcastSource:
+    name: str
+    feed_url: str
+    slug: str = ""
+    min_duration: int = 0  # seconds; 0 → global MIN_DURATION
+
+    def __post_init__(self) -> None:
+        if not self.slug:
+            self.slug = slugify(self.name)
+
+
+@dataclass
+class BlogSource:
+    name: str
+    feed_url: str
+    slug: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.slug:
+            self.slug = slugify(self.name)
+
+
+@dataclass
 class Config:
     vault_root: Path
     youtube: list[YouTubeSource] = field(default_factory=list)
     newsletters: list[NewsletterSource] = field(default_factory=list)
+    podcasts: list[PodcastSource] = field(default_factory=list)
+    blogs: list[BlogSource] = field(default_factory=list)
     account: str = "personal"
     newsletter_window_days: int = 1
+    podcast_window_days: int = PODCAST_WINDOW_DAYS
     hooks: dict = field(default_factory=dict)  # engage/blocked/release commands
 
 
@@ -128,8 +182,20 @@ def load_config() -> Config:
             subject=src.get("subject", ""),
             account=src.get("account", ""),
         ))
-    return Config(vault_root=vault, youtube=yt, newsletters=nl,
+    pods: list[PodcastSource] = []
+    for src in raw.get("podcast", []):
+        pods.append(PodcastSource(
+            name=src["name"],
+            feed_url=src["feed_url"],
+            min_duration=src.get("min_duration", 0),
+        ))
+    blogs: list[BlogSource] = []
+    for src in raw.get("blog", []):
+        blogs.append(BlogSource(name=src["name"], feed_url=src["feed_url"]))
+    return Config(vault_root=vault, youtube=yt, newsletters=nl, podcasts=pods,
+                  blogs=blogs,
                   account=account, newsletter_window_days=window,
+                  podcast_window_days=raw.get("podcast_window_days", PODCAST_WINDOW_DAYS),
                   hooks=raw.get("hooks", {}))
 
 
@@ -296,8 +362,9 @@ def deserialize_queue(raw: list[dict]) -> list[Item]:
 _last_feed_fetch = 0.0
 
 
-def fetch_feed(url: str) -> list[Item]:
-    """Poll a YouTube channel Atom feed. Cheap; no caption calls."""
+def http_get_with_retry(url: str) -> requests.Response:
+    """GET with the shared feed-polling discipline: FEED_SPACING between
+    calls, FEED_ATTEMPTS with exponential backoff."""
     global _last_feed_fetch
     wait = FEED_SPACING - (time.monotonic() - _last_feed_fetch)
     if wait > 0:
@@ -310,16 +377,19 @@ def fetch_feed(url: str) -> list[Item]:
             delay *= 2
         _last_feed_fetch = time.monotonic()
         try:
-            resp = requests.get(url, timeout=60)
+            resp = SESSION.get(url, timeout=60)
             resp.raise_for_status()
-            break
+            return resp
         except Exception as e:  # noqa: BLE001
             failure = e
             if attempt < FEED_ATTEMPTS - 1:
                 print(f"  feed fetch failed ({type(e).__name__}), retrying")
-    else:
-        raise failure  # type: ignore[misc]
+    raise failure  # type: ignore[misc]
 
+
+def fetch_feed(url: str) -> list[Item]:
+    """Poll a YouTube channel Atom feed. Cheap; no caption calls."""
+    resp = http_get_with_retry(url)
     root = ElementTree.fromstring(resp.content)
     items: list[Item] = []
     for entry in root.findall(f"{ATOM_NS}entry"):
@@ -354,10 +424,8 @@ def video_duration(video_id: str) -> int | None:
     """Fetch video duration in seconds from the watch page. Cheap but costs
     a network call, so only called for items not already in the vault."""
     try:
-        resp = requests.get(
-            f"https://www.youtube.com/watch?v={video_id}",
-            timeout=30, headers={"User-Agent": "Mozilla/5.0"},
-        )
+        resp = SESSION.get(f"https://www.youtube.com/watch?v={video_id}",
+                           timeout=30)
         m = re.search(r'"lengthSeconds":"(\d+)"', resp.text)
         return int(m.group(1)) if m else None
     except Exception:  # noqa: BLE001
@@ -435,7 +503,7 @@ def fetch_video_one_off(video_id: str) -> Item:
     """Resolve a pasted YouTube video URL into an Item via the oEmbed endpoint.
     Cheap, no caption call."""
     oembed = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
-    resp = requests.get(oembed, timeout=30)
+    resp = SESSION.get(oembed, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     title = data.get("title", video_id)
@@ -499,7 +567,6 @@ def gog_get(message_id: str, account: str) -> dict | None:
 def html_to_markdown(html: str) -> str:
     """Use defuddle to extract main content as markdown. Falls back to
     markdownify if defuddle (Node.js) is not available."""
-    import shutil
     if shutil.which("npx"):
         try:
             proc = subprocess.run(
@@ -604,6 +671,230 @@ def archive_newsletter(message_id: str, account: str) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Podcast fetcher (RSS + OpenAI transcription)
+# ──────────────────────────────────────────────────────────────────────
+
+def parse_itunes_duration(text: str | None) -> int | None:
+    """Parse an <itunes:duration> value: "HH:MM:SS", "MM:SS", or bare seconds."""
+    if not text:
+        return None
+    text = text.strip()
+    try:
+        parts = [int(p) for p in text.split(":")]
+    except ValueError:
+        return None
+    if not parts or len(parts) > 3:
+        return None
+    secs = 0
+    for p in parts:
+        secs = secs * 60 + p
+    return secs
+
+
+def fetch_podcast_feed(src: PodcastSource) -> list[Item]:
+    """Poll a podcast RSS 2.0 feed. Cheap; no downloads or transcription."""
+    resp = http_get_with_retry(src.feed_url)
+    root = ElementTree.fromstring(resp.content)
+    items: list[Item] = []
+    for entry in root.iter("item"):
+        enclosure = entry.find("enclosure")
+        if enclosure is None:
+            continue
+        audio_url = enclosure.get("url", "")
+        mime = enclosure.get("type", "")
+        if not audio_url or (mime and not mime.startswith("audio/")):
+            continue
+        guid_el = entry.find("guid")
+        item_id = (guid_el.text.strip() if guid_el is not None and guid_el.text
+                   else audio_url)
+        title_el = entry.find("title")
+        title = (title_el.text if title_el is not None else None) or "Untitled"
+        try:
+            published = parsedate_to_datetime(entry.findtext("pubDate", ""))
+            if published.tzinfo is None:
+                published = published.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            published = datetime.now(timezone.utc)
+        link = entry.findtext("link", "").strip() or audio_url
+        duration = parse_itunes_duration(entry.findtext(f"{ITUNES_NS}duration"))
+        items.append(Item(
+            source=src.slug,
+            source_name=src.name,
+            source_type="podcast",
+            item_id=item_id,
+            title=title.strip(),
+            url=link,
+            published=published,
+            fetcher="podcast",
+            extra={"enclosure_url": audio_url, "enclosure_type": mime,
+                   "duration": duration},
+        ))
+    return items
+
+
+def download_enclosure(url: str, dest: Path) -> None:
+    """Stream an audio enclosure to dest. Raises on HTTP errors or oversize."""
+    with SESSION.get(url, stream=True, timeout=120) as resp:
+        resp.raise_for_status()
+        written = 0
+        with dest.open("wb") as f:
+            for chunk in resp.iter_content(chunk_size=1 << 16):
+                written += len(chunk)
+                if written > ENCLOSURE_MAX_BYTES:
+                    raise ValueError(f"enclosure exceeds {ENCLOSURE_MAX_BYTES} bytes")
+                f.write(chunk)
+
+
+def transcode_audio(src: Path, dst: Path) -> bool:
+    """Downsample to 16kHz mono Opus 16kbps (~7.2MB/hour) so a full episode
+    fits in one transcription upload. Returns False on ffmpeg failure."""
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+           "-i", str(src), "-ac", "1", "-ar", "16000",
+           "-c:a", "libopus", "-b:a", "16k", str(dst)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=900, check=False)
+    except subprocess.TimeoutExpired:
+        print("  ffmpeg transcode timed out", file=sys.stderr)
+        return False
+    if proc.returncode != 0:
+        print(f"  ffmpeg failed: {proc.stderr.strip()[:200]}", file=sys.stderr)
+        return False
+    return True
+
+
+def split_audio(src: Path) -> list[Path]:
+    """Split a transcoded file into 40-minute segments for episodes so long
+    that even the downsampled file exceeds the upload cap. Returns [] on
+    failure."""
+    pattern = src.with_name(src.stem + "-part%03d" + src.suffix)
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+           "-i", str(src), "-f", "segment", "-segment_time", "2400",
+           "-c", "copy", str(pattern)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=300, check=False)
+    except subprocess.TimeoutExpired:
+        return []
+    if proc.returncode != 0:
+        print(f"  ffmpeg segment failed: {proc.stderr.strip()[:200]}", file=sys.stderr)
+        return []
+    return sorted(src.parent.glob(src.stem + "-part*" + src.suffix))
+
+
+def transcribe_audio(path: Path) -> tuple[str | None, str]:
+    """Send one audio file to the OpenAI transcription API.
+    Returns (text, status): "ok", "bad_audio" (permanent), or "error"."""
+    key = os.environ.get("OPENAI_API_KEY", "")
+    delay = 30.0
+    for attempt in range(2):
+        if attempt:
+            time.sleep(delay)
+        try:
+            with path.open("rb") as f:
+                resp = requests.post(
+                    TRANSCRIBE_URL,
+                    headers={"Authorization": f"Bearer {key}"},
+                    files={"file": (path.name, f)},
+                    data={"model": TRANSCRIBE_MODEL, "response_format": "text"},
+                    timeout=1800,
+                )
+        except Exception as e:  # noqa: BLE001
+            print(f"  transcription request failed: {type(e).__name__}", file=sys.stderr)
+            continue
+        if resp.status_code == 200:
+            return resp.text.strip(), "ok"
+        if resp.status_code == 429 or resp.status_code >= 500:
+            print(f"  transcription HTTP {resp.status_code}, retrying", file=sys.stderr)
+            continue
+        # Other 4xx: the audio itself was rejected — permanent.
+        print(f"  transcription rejected (HTTP {resp.status_code}): "
+              f"{resp.text.strip()[:200]}", file=sys.stderr)
+        return None, "bad_audio"
+    return None, "error"
+
+
+def fetch_podcast_transcript(item: Item) -> tuple[str | None, str]:
+    """Download, downsample, and transcribe one episode.
+    Returns (text, status): "ok", "bad_audio", or "error". All intermediate
+    files live in a tempdir that is removed even on failure."""
+    audio_url = item.extra.get("enclosure_url", "")
+    if not audio_url:
+        return None, "bad_audio"
+    with tempfile.TemporaryDirectory(prefix="gumshoe-pod-") as td:
+        raw = Path(td) / "episode.audio"
+        small = Path(td) / "episode.ogg"
+        try:
+            download_enclosure(audio_url, raw)
+        except ValueError as e:
+            print(f"  {e}", file=sys.stderr)
+            return None, "bad_audio"
+        except Exception as e:  # noqa: BLE001
+            print(f"  enclosure download failed: {type(e).__name__}", file=sys.stderr)
+            return None, "error"
+        if not transcode_audio(raw, small):
+            return None, "bad_audio"
+        if small.stat().st_size <= MAX_UPLOAD_BYTES:
+            parts = [small]
+        else:
+            parts = split_audio(small)
+            if not parts:
+                return None, "bad_audio"
+        texts: list[str] = []
+        for part in parts:
+            text, status = transcribe_audio(part)
+            if status != "ok":
+                return None, status
+            texts.append(text or "")
+        return "\n\n".join(texts).strip(), "ok"
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Blog fetcher (RSS + article extraction)
+# ──────────────────────────────────────────────────────────────────────
+
+def fetch_blog_feed(src: BlogSource) -> list[Item]:
+    """Poll a blog RSS 2.0 feed. Cheap; article pages are fetched later."""
+    resp = http_get_with_retry(src.feed_url)
+    root = ElementTree.fromstring(resp.content)
+    items: list[Item] = []
+    for entry in root.iter("item"):
+        link = entry.findtext("link", "").strip()
+        if not link:
+            continue
+        guid_el = entry.find("guid")
+        item_id = (guid_el.text.strip() if guid_el is not None and guid_el.text
+                   else link)
+        title = (entry.findtext("title") or "Untitled").strip()
+        try:
+            published = parsedate_to_datetime(entry.findtext("pubDate", ""))
+            if published.tzinfo is None:
+                published = published.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            published = datetime.now(timezone.utc)
+        items.append(Item(
+            source=src.slug,
+            source_name=src.name,
+            source_type="blog",
+            item_id=item_id,
+            title=title,
+            url=link,
+            published=published,
+            fetcher="blog",
+            extra={},
+        ))
+    return items
+
+
+def fetch_blog_body(item: Item) -> str | None:
+    """Fetch the article page and extract main content as markdown."""
+    resp = SESSION.get(item.url, timeout=60)
+    resp.raise_for_status()
+    body = html_to_markdown(resp.text)
+    return body if body.strip() else None
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Queue (one-off URL file)
 # ──────────────────────────────────────────────────────────────────────
 
@@ -691,36 +982,20 @@ def already_have(vault_root: Path, slug: str, item_id: str) -> bool:
     return False
 
 
-def emit_youtube(config: Config, item: Item, body: str) -> Path:
+def emit_item(config: Config, item: Item, body: str, extras: dict) -> Path:
+    """Write one item's markdown note. The shared frontmatter keys (and their
+    order) are the contract with the reporting tool; extras appends the
+    per-source-type fields."""
     meta = {
         "source": item.source_name,
-        "source_type": "youtube",
+        "source_type": item.source_type,
         "title": item.title,
         "url": item.url,
         "published": item.published.date().isoformat(),
         "fetched": datetime.now(timezone.utc).isoformat(),
         "item_id": item.item_id,
-        "author": item.extra.get("author", ""),
     }
-    slug = item.source or slugify(item.source_name)
-    return write_markdown(
-        output_path(config.vault_root, slug, item.published.date().isoformat(),
-                    item.title, item.item_id),
-        meta, body,
-    )
-
-
-def emit_newsletter(config: Config, item: Item, body: str) -> Path:
-    meta = {
-        "source": item.source_name,
-        "source_type": "newsletter",
-        "title": item.title,
-        "url": item.url,
-        "published": item.published.date().isoformat(),
-        "fetched": datetime.now(timezone.utc).isoformat(),
-        "item_id": item.item_id,
-        "from": item.extra.get("from", ""),
-    }
+    meta.update(extras)
     slug = item.source or slugify(item.source_name)
     return write_markdown(
         output_path(config.vault_root, slug, item.published.date().isoformat(),
@@ -778,6 +1053,72 @@ def scan(config: Config, state: dict, only: str | None = None) -> list[Item]:
                                      config.vault_root)
         queue.extend(msgs)
         print(f"  {len(msgs)} found")
+
+    for src in config.podcasts:
+        if only and only != src.slug and only != src.name:
+            continue
+        print(f"[scan] Podcast: {src.name}")
+        try:
+            eps = fetch_podcast_feed(src)
+        except Exception as e:  # noqa: BLE001
+            print(f"  feed fetch failed: {e}", file=sys.stderr)
+            record_failure(state, src.slug, "", f"feed fetch: {e}")
+            continue
+        # Recency cutoff: podcast feeds often carry the full back catalog, and
+        # transcription is paid — only take episodes newer than what the vault
+        # already holds (or the configured window on first scan).
+        latest = latest_vault_date(config.vault_root, src.slug)
+        if latest:
+            cutoff_date = datetime.fromisoformat(latest).replace(tzinfo=timezone.utc)
+        else:
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=config.podcast_window_days)
+        eps = [e for e in eps if e.published >= cutoff_date]
+        skipped = skipped_ids(state, src.slug)
+        # Prune skip entries that have aged out of the window — they can never
+        # be rediscovered, so the list stays bounded.
+        feed_ids = {e.item_id for e in eps}
+        if skipped - feed_ids:
+            state["sources"][src.slug]["skipped"] = sorted(skipped & feed_ids)
+            skipped &= feed_ids
+        kept = []
+        min_dur = src.min_duration or MIN_DURATION
+        for ep in eps:
+            if ep.item_id in skipped:
+                continue
+            dur = ep.extra.get("duration")
+            if dur is not None and dur < min_dur:
+                print(f"  skip ({dur}s): {ep.title[:60]}")
+                mark_skipped(state, src.slug, ep.item_id)
+                continue
+            if dur is not None and dur > MAX_EPISODE_SECONDS:
+                print(f"  skip (too long, {dur}s): {ep.title[:60]}")
+                record_failure(state, src.slug, ep.item_id, f"too long ({dur}s)")
+                mark_skipped(state, src.slug, ep.item_id)
+                continue
+            kept.append(ep)
+        queue.extend(kept)
+        print(f"  {len(kept)} in window (after duration filter)")
+
+    for src in config.blogs:
+        if only and only != src.slug and only != src.name:
+            continue
+        print(f"[scan] Blog: {src.name}")
+        try:
+            posts = fetch_blog_feed(src)
+        except Exception as e:  # noqa: BLE001
+            print(f"  feed fetch failed: {e}", file=sys.stderr)
+            record_failure(state, src.slug, "", f"feed fetch: {e}")
+            continue
+        # Same no-backfill rule as podcasts: only posts newer than what the
+        # vault holds (or the window on first scan).
+        latest = latest_vault_date(config.vault_root, src.slug)
+        if latest:
+            cutoff_date = datetime.fromisoformat(latest).replace(tzinfo=timezone.utc)
+        else:
+            cutoff_date = datetime.now(timezone.utc) - timedelta(days=config.podcast_window_days)
+        posts = [p for p in posts if p.published >= cutoff_date]
+        queue.extend(posts)
+        print(f"  {len(posts)} in window")
 
     if not only:
         for url in read_queue_file():
@@ -850,12 +1191,16 @@ def fetch(config: Config, state: dict, queue: list[Item]) -> tuple[int, int, int
     """Phase 3: fetch the queue with rate limits. Returns (fetched, deferred, failed).
     Newsletters have no rate limits and are always fetched. YouTube items are
     throttled; a block or cap stops YouTube processing but the queue is preserved
-    for the next run."""
+    for the next run. Podcasts are capped per run (transcription is paid) and
+    halt on missing prerequisites (ffmpeg, OPENAI_API_KEY), also preserving
+    the queue."""
     vault = config.vault_root
     fetched_count = 0
     deferred = 0
     failed = 0
     youtube_halted = False
+    podcast_halted = False
+    podcast_count = 0
     remaining: list[Item] = []  # items deferred or failed, for next run
 
     # Seed the hourly caption cap from state so it holds across runs
@@ -909,7 +1254,8 @@ def fetch(config: Config, state: dict, queue: list[Item]) -> tuple[int, int, int
                     remaining.append(item)
                     deferred += 1
                     continue
-                path = emit_youtube(config, item, text)
+                path = emit_item(config, item, text,
+                                 {"author": item.extra.get("author", "")})
                 mark_fetched(state, slug, item.item_id)
                 if item.extra.get("one_off"):
                     consume_queue_item(item.extra.get("queue_line", item.url))
@@ -924,9 +1270,81 @@ def fetch(config: Config, state: dict, queue: list[Item]) -> tuple[int, int, int
                     record_failure(state, slug, item.item_id, "no body")
                     failed += 1
                     continue
-                path = emit_newsletter(config, item, body)
+                path = emit_item(config, item, body,
+                                 {"from": item.extra.get("from", "")})
                 # Only archive out of the inbox once the vault note exists
                 archive_newsletter(item.item_id, item.extra.get("account") or config.account)
+                mark_fetched(state, slug, item.item_id)
+                fetched_count += 1
+                print(f"  wrote {path.relative_to(vault)}")
+
+            elif item.fetcher == "podcast":
+                if podcast_halted:
+                    remaining.append(item)
+                    deferred += 1
+                    continue
+                if not shutil.which("ffmpeg"):
+                    print("  ffmpeg not found — install with `brew install ffmpeg`; "
+                          "deferring podcast items", file=sys.stderr)
+                    podcast_halted = True
+                    remaining.append(item)
+                    deferred += 1
+                    continue
+                if not os.environ.get("OPENAI_API_KEY"):
+                    print("  OPENAI_API_KEY not set — needed for transcription; "
+                          "deferring podcast items", file=sys.stderr)
+                    podcast_halted = True
+                    remaining.append(item)
+                    deferred += 1
+                    continue
+                if podcast_count >= PODCAST_EPISODES_PER_RUN:
+                    print(f"  [defer] {item.title} — per-run podcast cap reached")
+                    remaining.append(item)
+                    deferred += 1
+                    continue
+                print(f"[fetch] Podcast: {item.title}")
+                podcast_count += 1
+                text, status = fetch_podcast_transcript(item)
+                if status == "bad_audio":
+                    print(f"  unusable audio — skipping {item.item_id} permanently")
+                    record_failure(state, slug, item.item_id, "unusable audio")
+                    mark_skipped(state, slug, item.item_id)
+                    failed += 1
+                    continue
+                if status == "error":
+                    print(f"  transcription error — will retry next run: {item.item_id}",
+                          file=sys.stderr)
+                    record_failure(state, slug, item.item_id, "transcription error (transient)")
+                    remaining.append(item)
+                    deferred += 1
+                    continue
+                path = emit_item(config, item, text, {
+                    "duration": item.extra.get("duration"),
+                    "audio_url": item.extra.get("enclosure_url", ""),
+                    "transcriber": TRANSCRIBE_MODEL,
+                })
+                mark_fetched(state, slug, item.item_id)
+                fetched_count += 1
+                print(f"  wrote {path.relative_to(vault)}")
+
+            elif item.fetcher == "blog":
+                print(f"[fetch] Blog: {item.title}")
+                try:
+                    body = fetch_blog_body(item)
+                except Exception as e:  # noqa: BLE001
+                    print(f"  article fetch error — will retry next run: {e}",
+                          file=sys.stderr)
+                    record_failure(state, slug, item.item_id, f"article fetch: {e}")
+                    remaining.append(item)
+                    deferred += 1
+                    continue
+                if body is None:
+                    print(f"  empty article body — skipping {item.item_id}")
+                    record_failure(state, slug, item.item_id, "empty article body")
+                    mark_skipped(state, slug, item.item_id)
+                    failed += 1
+                    continue
+                path = emit_item(config, item, body, {})
                 mark_fetched(state, slug, item.item_id)
                 fetched_count += 1
                 print(f"  wrote {path.relative_to(vault)}")
@@ -1061,6 +1479,7 @@ def cmd_sample(args: list[str]) -> int:
 vault_root = "~/Vaults/Gumshoe"
 account = "personal"            # gog account for newsletters
 newsletter_window_days = 1
+# podcast_window_days = 7      # first-scan lookback for new podcast sources
 
 [[youtube]]
 name = "Example Channel"
@@ -1075,6 +1494,20 @@ name = "Example Newsletter"
 sender = "newsletter@example.com"
 # subject = "Daily"            # optional subject match
 # account = "work"           # per-source override (default: global account)
+
+# Podcasts need `ffmpeg` on PATH (brew install ffmpeg) and OPENAI_API_KEY in
+# the environment — episodes are transcribed with OpenAI whisper-1
+# (~$0.36/hour of audio, capped at 5 episodes per run).
+[[podcast]]
+name = "Example Podcast"
+feed_url = "https://example.com/feed.xml"
+# min_duration = 300           # skip episodes shorter than this (seconds)
+
+# Blogs poll an RSS feed and extract each post's page as markdown.
+# podcast_window_days bounds the first scan for these too.
+[[blog]]
+name = "Example Blog"
+feed_url = "https://example.com/blog/feed/"
 
 # Optional external commands to rotate network egress when YouTube blocks an
 # IP. gumshoe runs them and reads the exit code (blocked: 0 = rotated, retry;
