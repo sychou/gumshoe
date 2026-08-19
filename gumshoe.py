@@ -748,8 +748,10 @@ def download_enclosure(url: str, dest: Path) -> None:
 def transcode_audio(src: Path, dst: Path) -> bool:
     """Downsample to 16kHz mono Opus 16kbps (~7.2MB/hour) so a full episode
     fits in one transcription upload. Returns False on ffmpeg failure."""
+    # -vn drops embedded cover art, which ffmpeg otherwise tries to encode
+    # as a theora video stream in the ogg container and fails.
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-           "-i", str(src), "-ac", "1", "-ar", "16000",
+           "-i", str(src), "-vn", "-ac", "1", "-ar", "16000",
            "-c:a", "libopus", "-b:a", "16k", str(dst)]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True,
